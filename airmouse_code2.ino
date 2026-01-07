@@ -8,10 +8,10 @@
 #define RIGHTBUTTON 18
 
 // --- CONFIGURATION SETTINGS ---
-#define SENSITIVITY 17      // Higher = faster cursor
-#define DEADZONE 0.05       // Ignore tiny movements (tremors)
-#define SLEEP_TIMEOUT 1000 // Time in ms before sleep (30 seconds)
-#define SMOOTHING 0.8       // Factor for Low Pass Filter (0.1 = very smooth/slow, 1.0 = raw/fast)
+#define SENSITIVITY 17      
+#define DEADZONE 0.05       // Increased slightly to ignore sensor noise/drift
+#define SLEEP_TIMEOUT 10000 // 30 seconds (30000ms) - 1 second was too short!
+#define SMOOTHING 0.9       // Adjusted for a better balance of lag vs jitter
 
 Adafruit_MPU6050 mpu;
 BleMouse bleMouse("ESP32 Air Mouse", "Maker", 100);
@@ -20,21 +20,27 @@ BleMouse bleMouse("ESP32 Air Mouse", "Maker", 100);
 unsigned long lastActivityTime = 0;
 float filteredX = 0;
 float filteredZ = 0;
-bool sleepMPU = true;
+bool isSleep = false;
 
 void goToSleep() {
-  Serial.println("Inactivity detected. Going to Deep Sleep...");
-  delay(100);
-  
-  // Configure wake up: When LEFTBUTTON (GPIO 19) goes LOW
-  // Note: Only specific pins work for ext0 wakeup, 19 usually works on most ESP32s
-  esp_sleep_enable_ext0_wakeup((gpio_num_t)LEFTBUTTON, 0); 
-  
-  // Power down the MPU6050
+  Serial.println("Inactivity detected. Going to Sleep...");
+  delay(200);
+
   mpu.enableSleep(true);
+  isSleep = true;
   
+  // Wake up when LEFTBUTTON (GPIO 19) is pressed (goes LOW)
+  // esp_sleep_enable_ext0_wakeup((gpio_num_t)LEFTBUTTON, 0); 
+  
+  // Power down the MPU6050 to save battery
+  // if (digitalRead(LEFTBUTTON) == LOW) {
+  //     mpu.enableSleep(false);
+  // } else {
+  //     mpu.enableSleep(true);
+  // }
+
   // Enter Deep Sleep
-  esp_deep_sleep_start();
+  // esp_light_sleep_start();
 }
 
 void setup() {
@@ -47,15 +53,13 @@ void setup() {
 
   if (!mpu.begin()) {
     Serial.println("Failed to find MPU6050 chip");
-    while (1) {
-      delay(10);
-    }
+    while (1) delay(10);
   }
 
-  // Optimize MPU6050 settings for mouse use
+  // Optimize MPU6050 settings
   mpu.setAccelerometerRange(MPU6050_RANGE_2_G);
   mpu.setGyroRange(MPU6050_RANGE_250_DEG);
-  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ); // Hardware noise reduction
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ); 
 
   lastActivityTime = millis();
   Serial.println("Air Mouse Ready!");
@@ -66,55 +70,74 @@ void loop() {
     sensors_event_t a, g, temp;
     mpu.getEvent(&a, &g, &temp);
 
-    // 1. SMOOTHING (Low Pass Filter)
-    // Helps remove the "shaking" effect from your hand
-    filteredX = (g.gyro.x * SMOOTHING) + (filteredX * (1.0 - SMOOTHING));
-    filteredZ = (g.gyro.z * SMOOTHING) + (filteredZ * (1.0 - SMOOTHING));
+    bool isMoving = false;
+
+    // 1. FILTERING
+    filteredX = (g.gyro.x * (1.0 - SMOOTHING)) + (filteredX * SMOOTHING);
+    filteredZ = (g.gyro.z * (1.0 - SMOOTHING)) + (filteredZ * SMOOTHING);
 
     // 2. MOVEMENT LOGIC
     if (abs(filteredX) > DEADZONE || abs(filteredZ) > DEADZONE) {
-      // Calculate move amounts
       int moveX = (int)(filteredZ * -SENSITIVITY);
       int moveY = (int)(filteredX * SENSITIVITY);
       
       bleMouse.move(moveX, moveY);
-      lastActivityTime = millis(); // Reset sleep timer because we moved
+      isMoving = true; // Mark activity
     }
 
-    // 3. LEFT BUTTON (Click & Drag / Long Press)
+    // 3. BUTTON LOGIC (LEFT)
     if (digitalRead(LEFTBUTTON) == LOW) {
       if (!bleMouse.isPressed(MOUSE_LEFT)) {
-        bleMouse.press(MOUSE_LEFT);
-        Serial.println("Left Button Pressed");
+        if (!isSleep) {
+          bleMouse.press(MOUSE_LEFT);
+          Serial.println("Left Click");
+        } else {
+          mpu.enableSleep(false);
+          isSleep = false;
+        }
+
       }
-      lastActivityTime = millis(); // Reset sleep timer
-    } else {
-      if (bleMouse.isPressed(MOUSE_LEFT)) {
-        bleMouse.release(MOUSE_LEFT);
-        Serial.println("Left Button Released");
-      }
+      isMoving = true; 
+    } else if (bleMouse.isPressed(MOUSE_LEFT)) {
+      bleMouse.release(MOUSE_LEFT);
     }
 
-    // 4. RIGHT BUTTON (Click & Drag)
+    // 4. BUTTON LOGIC (RIGHT)
     if (digitalRead(RIGHTBUTTON) == LOW) {
       if (!bleMouse.isPressed(MOUSE_RIGHT)) {
         bleMouse.press(MOUSE_RIGHT);
-        Serial.println("Right Button Pressed");
+        Serial.println("Right Click");
       }
-      lastActivityTime = millis(); // Reset sleep timer
+      isMoving = true;
+    } else if (bleMouse.isPressed(MOUSE_RIGHT)) {
+      bleMouse.release(MOUSE_RIGHT);
+    }
+
+    // 5. TIMER MANAGEMENT
+    if (isMoving) {
+      // If we are moving or clicking, keep resetting the timer
+      lastActivityTime = millis();
     } else {
-      if (bleMouse.isPressed(MOUSE_RIGHT)) {
-        bleMouse.release(MOUSE_RIGHT);
-        Serial.println("Right Button Released");
+      // If NOT moving, check if we have exceeded the timeout
+      unsigned long inactiveDuration = millis() - lastActivityTime;
+      
+      // Optional: Print countdown to serial every 5 seconds
+      if (inactiveDuration % 5000 < 20) { 
+        Serial.print("Inactive for: "); 
+        Serial.print(inactiveDuration / 1000); 
+        Serial.println("s"); 
+      }
+
+      if (inactiveDuration > SLEEP_TIMEOUT) {
+        goToSleep();
       }
     }
 
-    // 5. AUTO SLEEP
-    // If no movement or clicks for SLEEP_TIMEOUT duration
-    if (millis() - lastActivityTime > SLEEP_TIMEOUT) {
+    delay(10); 
+  } else {
+    // If BLE is disconnected, check for sleep after a while to save battery
+    if (millis() - lastActivityTime > (SLEEP_TIMEOUT * 2)) {
       goToSleep();
     }
-
-    delay(10); // Stability delay
   }
 }
